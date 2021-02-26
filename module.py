@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from torch.distributions import Categorical
+from mem_transformer import MemTransformer
 
 class Memory:
     def __init__(self):
@@ -24,29 +25,35 @@ class Memory:
 
 
 class StateRepresentation(nn.Module):
-    def __init__(self, state_rep, state_dim, action_dim, n_latent_var, device):
+    def __init__(self, H):
         super(StateRepresentation, self).__init__()
 
-        self.state_rep = state_rep
-        self.action_dim = action_dim
-        self.device = device
+        self.H = H
+        self.state_rep = H.state_rep
+        self.action_dim = H.action_dim
+        self.device = H.device
 
-        inp_dim = state_dim + action_dim + 1 # current state, previous action and reward
-        if state_rep == 'none':
-            out_dim = state_dim
+        inp_dim = H.state_dim + H.action_dim + 1 # current state, previous action and reward
+        if H.state_rep == 'none':
+            out_dim = H.state_dim
         else:
-            out_dim = n_latent_var
+            out_dim = H.n_latent_var
 
-        if state_rep == 'lstm':
+        if H.state_rep == 'lstm':
             self.layer = nn.LSTMCell(inp_dim, out_dim)
-            self.h0 = nn.Parameter(torch.rand(n_latent_var))
-            self.c0 = nn.Parameter(torch.rand(n_latent_var))
-        elif state_rep == 'trxl':
-            raise NotImplemented
-        elif state_rep == 'gtrxl':
+            self.h0 = nn.Parameter(torch.rand(H.n_latent_var))
+            self.c0 = nn.Parameter(torch.rand(H.n_latent_var))
+        elif H.state_rep == 'trxl':
+            self.layer = MemTransformer(
+                    inp_dim, n_layer=H.n_layer, n_head=H.n_head,
+                    d_model=H.n_latent_var,
+                    d_head=H.n_latent_var//H.n_head, d_inner=H.n_latent_var,
+                    dropout=H.dropout, dropatt=H.dropout, pre_lnorm=False,
+                    tgt_len=1, ext_len=0, mem_len=H.mem_len, attn_type=0)
+        elif H.state_rep == 'gtrxl':
             raise NotImplemented
 
-        self.init_action = nn.Parameter(torch.rand(action_dim))
+        self.init_action = nn.Parameter(torch.rand(H.action_dim))
         self.init_reward = nn.Parameter(torch.rand(1))
 
     def forward(self, t, state, _prev_action=None, _prev_reward=None):
@@ -62,6 +69,9 @@ class StateRepresentation(nn.Module):
             if self.state_rep == 'lstm':
                 self.h = self.h0.unsqueeze(0)
                 self.c = self.c0.unsqueeze(0)
+            if self.state_rep in ['trxl', 'gtrxl']:
+                self.inputs = []
+                self.mems = tuple()
         else:
             prev_action = torch.zeros(self.action_dim).to(self.device)
             prev_action[_prev_action] = 1
@@ -76,16 +86,19 @@ class StateRepresentation(nn.Module):
             self.h = h
             self.c = c
             return h[0]
-        elif self.state_rep == 'trxl':
-            raise NotImplemented
-        elif self.state_rep == 'gtrxl':
-            raise NotImplemented
+        elif self.state_rep in ['trxl', 'gtrxl']:
+            self.inputs.append(inp)
+            _inputs = torch.stack(self.inputs, dim=0)
+            pred, _mems = self.layer(_inputs, *self.mems)
+            if t >= (1+self.H.mem_len):
+                self.mems = _mems
+            return pred[0][0]
 
     def batch_forward(self, ts, states, actions, rewards):
 
         if self.state_rep == 'none':
             rep_states = torch.from_numpy(np.array(states)).float().to(self.device)
-        elif self.state_rep == 'lstm':
+        elif self.state_rep in ['lstm', 'trxl', 'gtrxl']:
             rep_states = []
             for i in range(len(ts)):
                 t = ts[i]
@@ -106,48 +119,44 @@ class StateRepresentation(nn.Module):
                     rep_states.append(self.forward(t, state, prev_action, prev_reward))
 
             rep_states = torch.stack(rep_states, dim=0)
-        elif self.state_rep == 'trxl':
-            raise NotImplemented
-        elif self.state_rep == 'gtrxl':
-            raise NotImplemented
 
         return rep_states
 
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, model, state_dim, action_dim, n_latent_var, state_rep, device):
+    def __init__(self, model, H):
         super(ActorCritic, self).__init__()
 
         self.model = model
-        self.device = device
-        self.state_rep = state_rep
-        if state_rep == 'none':
-            inp_dim = state_dim
+        self.device = H.device
+        self.state_rep = H.state_rep
+        if H.state_rep == 'none':
+            inp_dim = H.state_dim
         else:
-            inp_dim = n_latent_var
+            inp_dim = H.n_latent_var
 
         # actor
         self.action_layer = nn.Sequential(
-                nn.Linear(inp_dim, n_latent_var),
+                nn.Linear(inp_dim, H.n_latent_var),
                 nn.Tanh(),
-                nn.Linear(n_latent_var, n_latent_var),
+                nn.Linear(H.n_latent_var, H.n_latent_var),
                 nn.Tanh(),
-                nn.Linear(n_latent_var, action_dim),
+                nn.Linear(H.n_latent_var, H.action_dim),
                 nn.Softmax(dim=-1)
             )
 
         # critic
         self.value_layer = nn.Sequential(
-                nn.Linear(inp_dim, n_latent_var),
+                nn.Linear(inp_dim, H.n_latent_var),
                 nn.Tanh(),
-                nn.Linear(n_latent_var, n_latent_var),
+                nn.Linear(H.n_latent_var, H.n_latent_var),
                 nn.Tanh(),
-                nn.Linear(n_latent_var, 1)
+                nn.Linear(H.n_latent_var, 1)
             )
 
         # shared state representation module
-        self.shared_layer = StateRepresentation(state_rep, state_dim, action_dim, n_latent_var, device)
+        self.shared_layer = StateRepresentation(H)
 
     def forward(self):
         raise NotImplementedError
@@ -191,19 +200,20 @@ class ActorCritic(nn.Module):
         elif self.model == 'vmpo':
             return action_logprobs, torch.squeeze(state_value), dist_probs
 
+
 class VMPO:
-    def __init__(self, state_dim, action_dim, n_latent_var, lr, betas, gamma, K_epochs, state_rep, device):
-        self.lr = lr
-        self.betas = betas
-        self.gamma = gamma
-        self.K_epochs = K_epochs
+    def __init__(self, H):
+        self.lr = H.lr
+        self.betas = H.betas
+        self.gamma = H.gamma
+        self.K_epochs = H.K_epochs
         self.eta = torch.autograd.Variable(torch.tensor(1.0), requires_grad=True)
         self.alpha = torch.autograd.Variable(torch.tensor(0.1), requires_grad=True)
         self.eps_eta = 0.02
         self.eps_alpha = 0.1
-        self.device = device
+        self.device = H.device
 
-        self.policy = ActorCritic('vmpo', state_dim, action_dim, n_latent_var, state_rep, device).to(device)
+        self.policy = ActorCritic('vmpo', H).to(H.device)
 
         params = [
                 {'params': self.policy.parameters()},
@@ -211,8 +221,8 @@ class VMPO:
                 {'params': self.alpha}
             ]
 
-        self.optimizer = torch.optim.Adam(params, lr=lr, betas=betas)
-        self.policy_old = ActorCritic('vmpo', state_dim, action_dim, n_latent_var, state_rep, device).to(device)
+        self.optimizer = torch.optim.Adam(params, lr=H.lr, betas=H.betas)
+        self.policy_old = ActorCritic('vmpo', H).to(H.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.MseLoss = nn.MSELoss()
@@ -283,17 +293,17 @@ class VMPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
 class PPO:
-    def __init__(self, state_dim, action_dim, n_latent_var, lr, betas, gamma, K_epochs, eps_clip, state_rep, device):
-        self.lr = lr
-        self.betas = betas
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
-        self.device = device
+    def __init__(self, H):
+        self.lr = H.lr
+        self.betas = H.betas
+        self.gamma = H.gamma
+        self.eps_clip = H.eps_clip
+        self.K_epochs = H.K_epochs
+        self.device = H.device
 
-        self.policy = ActorCritic('ppo', state_dim, action_dim, n_latent_var, state_rep, device).to(device)
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=betas)
-        self.policy_old = ActorCritic('ppo', state_dim, action_dim, n_latent_var, state_rep, device).to(device)
+        self.policy = ActorCritic('ppo', H).to(H.device)
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=H.lr, betas=H.betas)
+        self.policy_old = ActorCritic('ppo', H).to(H.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.MseLoss = nn.MSELoss()
