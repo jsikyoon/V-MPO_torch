@@ -1,5 +1,6 @@
-HPARAMS_REGISTRY = {}
+import numpy as np
 
+HPARAMS_REGISTRY = {}
 
 class Hyperparams(dict):
     def __getattr__(self, attr):
@@ -13,14 +14,31 @@ class Hyperparams(dict):
 
 
 vmpo_none = Hyperparams()
+# model
 vmpo_none.model = 'vmpo'
 vmpo_none.state_rep = 'none'
+# env
+vmpo_none.env_name = 'rooms_watermaze'
+vmpo_none.action_dim = 9
+vmpo_none.action_list = np.array([
+        [0, 0, 0, 1, 0, 0, 0],    # Forward
+        [0, 0, 0, -1, 0, 0, 0],   # Backward
+        [0, 0, -1, 0, 0, 0, 0],   # Strafe Left
+        [0, 0, 1, 0, 0, 0, 0],    # Strafe Right
+        [-20, 0, 0, 0, 0, 0, 0],  # Look Left
+        [20, 0, 0, 0, 0, 0, 0],   # Look Right
+        [-20, 0, 0, 1, 0, 0, 0],  # Look Left + Forward
+        [20, 0, 0, 1, 0, 0, 0],   # Look Right + Forward
+        [0, 0, 0, 0, 1, 0, 0],    # Fire.
+    ])
 HPARAMS_REGISTRY['vmpo_none'] = vmpo_none
 
-vmpo_lstm = Hyperparams()
-vmpo_lstm.model = 'vmpo'
-vmpo_lstm.state_rep = 'lstm'
-HPARAMS_REGISTRY['vmpo_lstm'] = vmpo_lstm
+
+ppo_none = Hyperparams()
+ppo_none.update(vmpo_none)
+# model
+ppo_none.model = 'ppo'
+HPARAMS_REGISTRY['ppo_none'] = ppo_none
 
 
 
@@ -44,6 +62,7 @@ def add_arguments(parser):
     parser.add_argument('--save_dir', type=str, default='./saved_models')
     parser.add_argument('--desc', type=str, default='test')
     parser.add_argument('--hparam_sets', '--hps', type=str)
+    parser.add_argument('--gpu', type=str, default='0')
 
     # model
     parser.add_argument('--model', type=str, default='vmpo', help='{vmpo|ppo}')
@@ -55,19 +74,19 @@ def add_arguments(parser):
     parser.add_argument('--mem_len', type=int, default=10)
 
     # env
-    parser.add_argument('--env_name', type=str, default='LunarLander-v2')
-    parser.add_argument('--action_dim', type=int, default=4)
-    parser.add_argument('--solved_reward', type=int, default=230)
-    parser.add_argument('--log_interval', type=int, default=20)
+    parser.add_argument('--env_name', type=str, default='rooms_watermaze')
+    parser.add_argument('--action_dim', type=int, default=9)
+    parser.add_argument('--log_interval', type=int, default=40)
     parser.add_argument('--max_episodes', type=int, default=50000)
     parser.add_argument('--max_timesteps', type=int, default=300)
-    parser.add_argument('--update_timestep', type=int, default=2400)
+    parser.add_argument('--update_timestep', type=int, default=1200)
+    parser.add_argument('--action_list', type=list, default=[])
 
     # training
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--betas', type=tuple, default=(0.9, 0.999))
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--K_epochs', type=int, default=8)
+    parser.add_argument('--K_epochs', type=int, default=4)
     parser.add_argument('--eps_clip', type=float, default=0.2)
 
     return parser

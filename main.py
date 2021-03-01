@@ -1,15 +1,28 @@
+import os
 import torch
-import gym
+import numpy as np
 from module import Memory, VMPO, PPO
 from utils import set_up_hyperparams
+from tensorboardX import SummaryWriter
+
+import deepmind_lab
 
 def main():
 
     H, logprint = set_up_hyperparams()
+    tb_logger = SummaryWriter(H.save_dir)
 
-    env = gym.make(H.env_name)
-    H.state_dim = env.observation_space.shape[0]
-    H.device = 'cpu'
+    env = deepmind_lab.Lab(
+            level='contributed/dmlab30/'+H.env_name,
+            observations=['RGB_INTERLEAVED'],
+            config={
+                'width': '64',
+                'height': '64',
+                'logLevel': 'WARN',
+                }
+            )
+    H.img_size = 64
+    H.device = 'cuda:'+H.gpu if H.gpu is not None else 'cpu'
 
     memory = Memory()
     if H.model == 'vmpo':
@@ -24,23 +37,27 @@ def main():
 
     # Training loop
     for i_episode in range(1, H.max_episodes+1):
-        state = env.reset()
+        env.reset()
         for t in range(H.max_timesteps):
+            img = env.observations()['RGB_INTERLEAVED']
             timestep += 1
 
             # Running policy_old:
-            action = agent.policy_old.act(t, state, memory)
-            state, reward, done, _ = env.step(action)
+            action = agent.policy_old.act(t, img, memory)
+            reward = env.step(H.action_list[action].astype(np.intc))
+
+            if env.is_running():
+                done = False
+            else:
+                done = True
 
             # Saving reward and is_terminal:
             memory.rewards.append(reward)
             memory.is_terminals.append(done)
 
             running_reward += reward
-            if running_reward > (H.log_interval*H.solved_reward)*0.8:
-                env.render()
 
-            if done:
+            if not env.is_running():
                 break
 
         # Update if its time
@@ -51,18 +68,13 @@ def main():
 
         avg_length += t
 
-        # Stop training if avg_reward > solved_reward
-        if running_reward > (H.log_interval*H.solved_reward):
-            print('######### Solved! ############')
-            torch.save(agent.policy.state_dict(), './{}_{}_{}.pth'.format(model, state_representation, env_name))
-            break
-
         # Logging
         if i_episode % H.log_interval == 0:
             avg_length = int(avg_length/H.log_interval)
             running_reward = int((running_reward/H.log_interval))
 
-            print('Episode {} \t avg length: {} \t reward: {}'.format(i_episode, avg_length, running_reward))
+            logprint(model=H.desc,  type='tr_loss', episodes=i_episode,
+                    **{'avg_length': avg_length, 'running_reward': running_reward})
             running_reward = 0
             avg_length = 0
 

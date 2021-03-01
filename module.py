@@ -3,13 +3,14 @@ import numpy as np
 import torch.nn as nn
 from torch.distributions import Categorical
 from mem_transformer import MemTransformer
+from model import ImgEncoder
 
 class Memory:
     def __init__(self):
         self.ts = []
         self.actions = []
         self.rep_states = []
-        self.states = []
+        self.images = []
         self.logprobs = []
         self.rewards = []
         self.is_terminals = []
@@ -18,7 +19,7 @@ class Memory:
         del self.ts[:]
         del self.actions[:]
         del self.rep_states[:]
-        del self.states[:]
+        del self.images[:]
         del self.logprobs[:]
         del self.rewards[:]
         del self.is_terminals[:]
@@ -33,11 +34,10 @@ class StateRepresentation(nn.Module):
         self.action_dim = H.action_dim
         self.device = H.device
 
-        inp_dim = H.state_dim + H.action_dim + 1 # current state, previous action and reward
-        if H.state_rep == 'none':
-            out_dim = H.state_dim
-        else:
-            out_dim = H.n_latent_var
+        inp_dim = H.n_latent_var + H.action_dim + 1 # current state, previous action and reward
+        out_dim = H.n_latent_var
+
+        self.resnet = ImgEncoder(G=1, img_enc_dim=H.n_latent_var)
 
         if H.state_rep == 'lstm':
             self.layer = nn.LSTMCell(inp_dim, out_dim)
@@ -56,9 +56,10 @@ class StateRepresentation(nn.Module):
         self.init_action = nn.Parameter(torch.rand(H.action_dim))
         self.init_reward = nn.Parameter(torch.rand(1))
 
-    def forward(self, t, state, _prev_action=None, _prev_reward=None):
+    def forward(self, t, img, _prev_action=None, _prev_reward=None):
 
-        state = torch.from_numpy(state).float().to(self.device)
+        img = torch.from_numpy(img).float().to(self.device).unsqueeze(0).permute(0,3,1,2)
+        state = self.resnet(img).squeeze()
 
         if self.state_rep == 'none':
                 return state
@@ -94,15 +95,17 @@ class StateRepresentation(nn.Module):
                 self.mems = _mems
             return pred[0][0]
 
-    def batch_forward(self, ts, states, actions, rewards):
+    def batch_forward(self, ts, images, actions, rewards):
 
         if self.state_rep == 'none':
-            rep_states = torch.from_numpy(np.array(states)).float().to(self.device)
-        elif self.state_rep in ['lstm', 'trxl', 'gtrxl']:
+            images = np.array(images)
+            images = torch.from_numpy(images).float().to(self.device).permute(0,3,1,2)
+            rep_states = self.resnet(images).squeeze()
+        else:
             rep_states = []
             for i in range(len(ts)):
                 t = ts[i]
-                state = states[i]
+                image = images[i]
                 action = actions[i]
                 reward = rewards[i]
 
@@ -114,9 +117,9 @@ class StateRepresentation(nn.Module):
                     prev_reward = rewards[i-1]
 
                 if t==0:
-                    rep_states.append(self.forward(t, state))
+                    rep_states.append(self.forward(t, image))
                 else:
-                    rep_states.append(self.forward(t, state, prev_action, prev_reward))
+                    rep_states.append(self.forward(t, image, prev_action, prev_reward))
 
             rep_states = torch.stack(rep_states, dim=0)
 
@@ -131,10 +134,7 @@ class ActorCritic(nn.Module):
         self.model = model
         self.device = H.device
         self.state_rep = H.state_rep
-        if H.state_rep == 'none':
-            inp_dim = H.state_dim
-        else:
-            inp_dim = H.n_latent_var
+        inp_dim = H.n_latent_var
 
         # actor
         self.action_layer = nn.Sequential(
@@ -161,28 +161,28 @@ class ActorCritic(nn.Module):
     def forward(self):
         raise NotImplementedError
 
-    def act(self, t, state, memory):
+    def act(self, t, img, memory):
 
         if t==0:
-            rep_state = self.shared_layer(t, state)
+            rep_state = self.shared_layer(t, img)
         else:
-            rep_state = self.shared_layer(t, state, memory.actions[-1], memory.rewards[-1])
+            rep_state = self.shared_layer(t, img, memory.actions[-1], memory.rewards[-1])
 
         action_probs = self.action_layer(rep_state)
         dist = Categorical(action_probs)
         action = dist.sample()
 
         memory.ts.append(t)
-        memory.states.append(state)
+        memory.images.append(img)
         memory.rep_states.append(rep_state)
         memory.actions.append(action)
         memory.logprobs.append(dist.log_prob(action))
 
         return action.item()
 
-    def evaluate(self, ts, states, actions, rewards):
+    def evaluate(self, ts, images, actions, rewards):
 
-        rep_states = self.shared_layer.batch_forward(ts, states, actions, rewards)
+        rep_states = self.shared_layer.batch_forward(ts, images, actions, rewards)
 
         action_probs = self.action_layer(rep_states.detach())
         dist = Categorical(action_probs)
@@ -247,7 +247,7 @@ class VMPO:
 
         # Convert list to tensor
         old_ts = memory.ts
-        old_states = memory.states
+        old_states = memory.images
         old_actions = torch.stack(memory.actions).to(self.device).detach()
         old_rewards = memory.rewards
 
@@ -324,20 +324,20 @@ class PPO:
 
         # Convert list to tensor
         old_ts = memory.ts
-        old_states = memory.states
+        old_images = memory.images
         old_actions = torch.stack(memory.actions).to(self.device).detach()
         old_rewards = memory.rewards
         old_logprobs = torch.stack(memory.logprobs).to(self.device).detach()
 
         # Get old probs and old advantages
         with torch.no_grad():
-            _, old_state_values, old_dist_probs = self.policy_old.evaluate(old_ts, old_states, old_actions, old_rewards)
+            _, old_state_values, old_dist_probs = self.policy_old.evaluate(old_ts, old_images, old_actions, old_rewards)
             advantages = rewards - old_state_values.detach()
 
         # Optimize policy for K epochs:
         for i in range(self.K_epochs):
             # Evaluating sampled actions and values:
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_ts, old_states, old_actions, old_rewards)
+            logprobs, state_values, dist_entropy = self.policy.evaluate(old_ts, old_images, old_actions, old_rewards)
 
             # Finding the ratio (pi_theta / pi_theta__old):
             ratios = torch.exp(logprobs - old_logprobs.detach())
